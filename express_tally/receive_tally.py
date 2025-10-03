@@ -2,6 +2,8 @@ from __future__ import unicode_literals
 
 import frappe
 import json
+from itertools import groupby
+from operator import itemgetter
 
 @frappe.whitelist()
 def customer_group():
@@ -409,32 +411,128 @@ def supplier():
 
     return {"status": True, 'data': tally_response}    
 
+
 @frappe.whitelist()
 def account():
     payload = json.loads(frappe.request.data)
-    accounts = payload['data']
+    accounts = payload["data"]
 
     tally_response = []
 
-    for account in accounts:
-        is_exists = frappe.db.exists(
-            account['doctype'], account['account_name'])
-        if not is_exists:
-            try:
+    for company, account_data in groupby(accounts, key=itemgetter("company")):
+        created = {}
+        parent_accounts = []
+        account_data = list(account_data)
 
-                doc = frappe.get_doc(account)
-                doc.insert()
+        data = frappe.db.get_all("Account",
+            filters={
+                'company': company
+            },
+            fields=['name', 'account_name', 'parent_account'])
+        for d in data:
+            created[d["account_name"]] = d.name
+            if d["parent_account"]:
+                account_name = "-".join(
+                    d["parent_account"].split("-")[:-1]
+                ).strip()
+                parent_accounts.append(account_name)
 
-                tally_response.append(
-                    {'name': account['account_name'], 'tally_object': 'Ledger', 'message': 'Success'})
-            except Exception as e:
-                tally_response.append(
-                    {'name': account['account_name'], 'tally_object': 'Ledger', 'message': str(e)})
-        else:
-            tally_response.append(
-                    {'name': account['account_name'], 'tally_object': 'Ledger', 'message': 'Already Exists'})
-        
-    return {"status": True, 'data': tally_response}    
+        for a in account_data:
+            if a["parent_account"]:
+                account_name = "-".join(
+                    a["parent_account"].split("-")[:-1]
+                ).strip()
+                parent_accounts.append(account_name)
+
+        while account_data:
+            inserted_in_this_round = False
+
+            for acc in account_data[:]:  # iterate copy
+                temp_acc = "-".join(acc["parent_account"].split("-")[:-1]).strip()
+                if acc["account_name"] == temp_acc:
+                    acc["parent_account"] = None
+                parent = acc["parent_account"]
+
+                # insert only if parent is blank or already created
+                if not parent or parent in created.values():
+                    is_exists = frappe.db.exists(
+                        acc["doctype"],
+                        {"account_name": acc["account_name"], "company": company},
+                    )
+                    if not is_exists:
+                        try:
+                            if acc["account_name"] in parent_accounts:
+                                acc["is_group"] = 1
+
+                            doc = frappe.get_doc(acc)
+                            doc.flags.ignore_mandatory = True
+                            doc.flags.ignore_validate = True
+                            doc.insert(ignore_permissions=True)
+
+                            tally_response.append(
+                                {
+                                    "name": acc["account_name"],
+                                    "tally_object": "Ledger",
+                                    "message": "Success",
+                                }
+                            )
+                            created[acc["account_name"]] = doc.name
+                            inserted_in_this_round = True
+                        except Exception as e:
+                            tally_response.append(
+                                {
+                                    "name": acc["account_name"],
+                                    "tally_object": "Ledger",
+                                    "message": str(e),
+                                }
+                            )
+                    else:
+                        tally_response.append(
+                            {
+                                "name": acc["account_name"],
+                                "tally_object": "Ledger",
+                                "message": "Already Exists",
+                            }
+                        )
+
+                    account_data.remove(acc)
+
+            if not inserted_in_this_round:
+                # could not insert any more → break to avoid infinite loop
+                for acc in account_data:
+                    tally_response.append(
+                        {
+                            "name": acc["account_name"],
+                            "tally_object": "Ledger",
+                            "message": "Please pass full Chart of Accounts for {company}".format(
+                                company=company
+                            ),
+                        }
+                    )
+                break
+
+    return {"status": True, "data": tally_response}
+
+
+def validate_accounts(accounts):
+    missing = []
+    for company, account_data in groupby(accounts, key=itemgetter("company")):
+        account_names = {a["account_name"] for a in account_data}
+        for acc in account_data:
+            if acc["parent_account"] and acc["parent_account"] not in account_names:
+                # also check if parent exists already in ERPNext DB
+                if not frappe.db.exists(
+                    "Account",
+                    {"account_name": acc["parent_account"], "company": company},
+                ):
+                    missing.append(
+                        {
+                            "name": acc["account_name"],
+                            "tally_object": "Ledger",
+                            "message": f"Parent account '{acc['parent_account']}' for account '{acc['account_name']}' is missing",
+                        }
+                    )
+    return missing
 
 
 def create_account(customer):
@@ -573,8 +671,6 @@ def create_address(customer):
         # return {'name': customer['customer_name'], 'tally_object': 'Ledger_Address', 'message': str(e)}
 
 
-
-
 @frappe.whitelist()
 def uom():
     payload = json.loads(frappe.request.data)
@@ -599,7 +695,6 @@ def uom():
                     {'name': uom['uom_name'], 'tally_object': 'Unit', 'message': 'Already Exists'})
 
     return {"status": True, 'data': tally_response}
-
 
 
 @frappe.whitelist()
@@ -678,4 +773,3 @@ def voucher():
                     {'name': sale['tally_masterid'], 'docname': doc.name, 'tally_object': 'voucher', 'message': 'Already Exists'})
 
     return {"status": True, 'data': tally_response}
-    
